@@ -1,51 +1,82 @@
 import axios from 'axios';
 import cheerio from 'cheerio';
-// import { URL } from 'url';
-import urlParser from 'url';
+
+type ScrapResult = {
+  url_base: string;
+  tipo: string;
+  total_links_encontrados: number;
+  links: string[];
+};
 
 class Scrap {
-  async getScrap({ url }: { url: string }) {
-    if (!url) {
-      throw new Error('URL é obrigatória');
-    }
+  private concurrencyLimit = 5;
 
-    const visitedUrls = new Set();
-    const urlsToVisit = [url];
-    const allLinks = new Set();
+  async getScrap({ url }: { url: string }): Promise<ScrapResult> {
+    if (!url) throw new Error('URL é obrigatória');
+
+    const visitedUrls = new Set<string>();
+    const allLinks = new Set<string>();
     const baseUrl = new URL(url);
 
     const isSourceCode = url.match(/\.(js|css|html|ts|jsx|tsx|json)$/i);
 
-    const showProgress = (current: any, total: number, currentUrl: any) => {
-      const progress = Math.round((current / total) * 100);
-      const barLength = 30;
-      const filledLength = Math.round((progress / 100) * barLength);
-      const bar = '█'.repeat(filledLength) + '░'.repeat(barLength - filledLength);
+    const queue: string[] = [url];
 
-      console.clear(); // Limpa o console para atualização
-      console.log('\n=== Progresso do Scraping ===');
-      // console.log(`URL atual: ${currentUrl}`);
-      console.log(`[${bar}] ${progress}%`);
-      console.log(`Processados: ${current} de ${total}`);
-      console.log(`Links encontrados: ${allLinks.size}`);
-      console.log('===========================\n');
+    const resolveUrl = (from: string, to: string) => {
+      try {
+        return new URL(to, from).toString();
+      } catch {
+        return null;
+      }
     };
 
-    // Contador inicial
-    let totalUrls = 1;
-    let processedUrls = 0;
-
-    while (urlsToVisit.length > 0) {
-      const currentUrl = urlsToVisit.pop();
-
-      if (visitedUrls.has(currentUrl)) {
-        processedUrls++;
-        showProgress(processedUrls, totalUrls, currentUrl);
-        continue;
+    const extractLinksFromSource = (content: string, currentUrl: string) => {
+      // URLs em strings
+      const urlRegex = /(https?:\/\/[^\s"']+)/g;
+      const matches = content.match(urlRegex) || [];
+      for (const match of matches) {
+        const parsed = this.safeParseUrl(match);
+        if (parsed && parsed.hostname === baseUrl.hostname) {
+          allLinks.add(match);
+          if (!visitedUrls.has(match)) queue.push(match);
+        }
       }
+      // imports/requires
+      const importRegex = /(?:import|require)\s*\(?['"]([^'"]+)['"]\)?/g;
+      let importMatch;
+      while ((importMatch = importRegex.exec(content)) !== null) {
+        const importPath = importMatch[1];
+        const absoluteUrl = resolveUrl(currentUrl, importPath);
+        if (!absoluteUrl) continue;
+        const parsed = this.safeParseUrl(absoluteUrl);
+        if (parsed && parsed.hostname === baseUrl.hostname) {
+          allLinks.add(absoluteUrl);
+          if (!visitedUrls.has(absoluteUrl)) queue.push(absoluteUrl);
+        }
+      }
+    };
 
+    const extractLinksFromHtml = (html: string, currentUrl: string) => {
+      const $ = cheerio.load(html);
+      $('a[href]').each((_, link) => {
+        const href = $(link).attr('href');
+        if (!href) return;
+        const absoluteUrl = resolveUrl(currentUrl, href);
+        if (!absoluteUrl) return;
+        const parsed = this.safeParseUrl(absoluteUrl);
+        if (parsed && parsed.hostname === baseUrl.hostname) {
+          allLinks.add(absoluteUrl);
+          if (!visitedUrls.has(absoluteUrl)) queue.push(absoluteUrl);
+        }
+      });
+    };
+
+    let processed = 0;
+
+    const processUrl = async (currentUrl: string) => {
+      if (visitedUrls.has(currentUrl)) return;
+      visitedUrls.add(currentUrl);
       try {
-        console.log(`Analisando: ${currentUrl}`);
         const response = await axios.get(currentUrl, {
           timeout: 10000,
           headers: {
@@ -53,91 +84,25 @@ class Scrap {
               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
           },
         });
-
-        visitedUrls.add(currentUrl);
-        processedUrls++;
-
         if (isSourceCode) {
-          const content = response.data;
-
-          // Procura por URLs em strings
-          const urlRegex = /(https?:\/\/[^\s"']+)/g;
-          const matches = content.match(urlRegex);
-
-          if (matches) {
-            matches.forEach((match: any) => {
-              try {
-                const parsedUrl = new URL(match);
-                if (parsedUrl.hostname === baseUrl.hostname) {
-                  allLinks.add(match);
-                  if (!visitedUrls.has(match) && !urlsToVisit.includes(match)) {
-                    urlsToVisit.push(match);
-                    totalUrls++;
-                  }
-                }
-              } catch (error) {
-                console.error(`Erro ao processar URL: ${match}`);
-              }
-            });
-          }
-
-          // Procura por imports/requires
-          const importRegex = /(?:import|require)\s*\(?['"]([^'"]+)['"]\)?/g;
-          let importMatch;
-          while ((importMatch = importRegex.exec(content)) !== null) {
-            const importPath = importMatch[1];
-            try {
-              const absoluteUrl = urlParser.resolve(currentUrl, importPath);
-              const parsedUrl = new URL(absoluteUrl);
-              if (parsedUrl.hostname === baseUrl.hostname) {
-                allLinks.add(absoluteUrl);
-                if (!visitedUrls.has(absoluteUrl) && !urlsToVisit.includes(absoluteUrl)) {
-                  urlsToVisit.push(absoluteUrl);
-                  totalUrls++;
-                }
-              }
-            } catch (error) {
-              console.error(`Erro ao processar import: ${importPath}`);
-            }
-          }
+          extractLinksFromSource(response.data, currentUrl);
         } else {
-          const $ = cheerio.load(response.data);
-          $('a').each((i, link) => {
-            const href = $(link).attr('href');
-            if (href) {
-              try {
-                const absoluteUrl = urlParser.resolve(currentUrl, href);
-                const parsedUrl = new URL(absoluteUrl);
-                if (parsedUrl.hostname === baseUrl.hostname) {
-                  allLinks.add(absoluteUrl);
-                  if (!visitedUrls.has(absoluteUrl) && !urlsToVisit.includes(absoluteUrl)) {
-                    urlsToVisit.push(absoluteUrl);
-                    totalUrls++;
-                  }
-                }
-              } catch (error) {
-                console.error(`Erro ao processar URL: ${href}`);
-              }
-            }
-          });
+          extractLinksFromHtml(response.data, currentUrl);
         }
-
-        showProgress(processedUrls, totalUrls, currentUrl);
-
-        // Aguarda 1 segundo entre as requisições
-        await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error: any) {
-        console.error(`Erro ao acessar ${currentUrl}:`, error.message);
-        processedUrls++;
-        showProgress(processedUrls, totalUrls, currentUrl);
+        // Silencia erros de requisição
+      } finally {
+        processed++;
+        this.showProgress(processed, queue.length + processed, allLinks.size);
       }
+    };
+
+    while (queue.length > 0) {
+      const batch = queue.splice(0, this.concurrencyLimit);
+      await Promise.allSettled(batch.map(processUrl));
     }
 
-    // Mostra resultado final
-    console.log('\n=== Scraping Concluído ===');
-    console.log(`Total de URLs processadas: ${processedUrls}`);
-    console.log(`Total de links únicos encontrados: ${allLinks.size}`);
-    console.log('===========================\n');
+    this.showFinalResult(processed, allLinks.size);
 
     return {
       url_base: url,
@@ -145,6 +110,29 @@ class Scrap {
       total_links_encontrados: allLinks.size,
       links: Array.from(allLinks),
     };
+  }
+
+  private safeParseUrl(url: string): URL | null {
+    try {
+      return new URL(url);
+    } catch {
+      return null;
+    }
+  }
+
+  private showProgress(current: number, total: number, found: number) {
+    const progress = Math.round((current / total) * 100);
+    const barLength = 30;
+    const filledLength = Math.round((progress / 100) * barLength);
+    const bar = '█'.repeat(filledLength) + '░'.repeat(barLength - filledLength);
+    console.log(`[${bar}] ${progress}% | Processados: ${current}/${total} | Links encontrados: ${found}`);
+  }
+
+  private showFinalResult(processed: number, found: number) {
+    console.log('\n=== Scraping Concluído ===');
+    console.log(`Total de URLs processadas: ${processed}`);
+    console.log(`Total de links únicos encontrados: ${found}`);
+    console.log('===========================\n');
   }
 }
 

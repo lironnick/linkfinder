@@ -19,6 +19,7 @@ const start = async () => {
         📖 Endpoints disponíveis:
           GET  /ping             - Health check
           POST /analyze/url      - Analisa JavaScript de URL
+          POST /scrap            - Buscando JavaScript
     `);
   } catch (err) {
     console.error(err);
